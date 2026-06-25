@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Model weights
+*.safetensors
+*.gguf
+models/
+
+# Outputs & secrets
+*.log
+.env
+
+# OS
+.DS_Store
