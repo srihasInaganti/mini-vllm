@@ -23,6 +23,7 @@ class ModelConfig:
     model_id: str = "Qwen/Qwen2.5-0.5B-Instruct"
     device: str = "cpu"
     dtype: torch.dtype = torch.float32
+    block_size: int = 16            # tokens per KV cache block
 
     @property
     def n_rep(self) -> int:

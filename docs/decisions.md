@@ -75,3 +75,64 @@ Checked against the actual tensors, not memory:
 - RoPE theta is 1e6, not 1e4. The wrong value corrupts later positions.
 - q/k/v projections have a bias. o_proj doesn't.
 - embeddings tied, no lm_head.
+
+---
+
+## Milestone 2
+
+The goal is to stop recomputing K/V every decode step. Each token's K/V get
+stored once and looked up later, but the storage is split into fixed-size blocks
+drawn from a shared pool instead of one contiguous tensor per sequence. Output
+still has to match Milestone 1 token-for-token.
+
+### Why paging instead of one contiguous tensor per sequence
+
+A contiguous cache means reserving a slab big enough for the longest
+the sequence might ever get. Real prompts don't all reach that length, so most of
+each slab sits empty but reserved. And once a few sequences of different lengths
+come and go, the free space left between them is chopped into pieces too small to
+fit the next request even when the total free space is plenty.
+
+To get around this I utilized paging because it cuts down the memory into uniform blocks.
+A sequence grabs blocks one at a time only as it grows, and a block table maps the
+sequence's logical positions to whatever physical blocks it happened to get. The
+blocks don't have to be next to each other, so there are no unusable gaps. 
+The waste drops from a whole slab to at most one partly filled block per sequence.
+
+### How attention reads the cache
+
+**Problem:** the keys and values for a sequence are now scattered across blocks
+that aren't contiguous, but the attention math wants them in order.
+
+**Options:** gather the blocks back into a contiguous tensor and run the M1
+attention as-is, or attend block-by-block with a running softmax and never
+reconstruct.
+
+**Decision:** I gather and reconstruct. It reuses the exact M1 attention, so
+parity is easy to trust, and the only cost is briefly materializing the
+contiguous K/V. The block-by-block version is closer to a real paged kernel but
+much more code and a parity risk. This is also the spot where a custom CUDA paged
+kernel would slot in later. Instead of having to gather, a custom CUDA kernal could read straight from the blocks.
+
+### Pool layout
+
+**Problem:** where do the K/V tensors actually live.
+
+**Decision:** one K and one V tensor per layer, each a flat
+(num_blocks * block_size, num_kv_heads, head_dim) tensor. Flat so a single slot id
+(block * block_size + offset) indexes it directly, which makes write and gather
+one-liners. Only the 2 KV heads are stored.
+
+### Scope
+
+**Decision:** one sequence at a time. Batching across sequences and an eviction
+policy when the pool runs out belong with the scheduler, so I kept those out and
+let `allocate` just raise when blocks run dry. That keeps this milestone purely
+about cache accuracy.
+
+### At scale
+
+The pool is sized once from a memory budget. At 100x traffic that budget, the
+block size, and how full the last block runs become the levers that decide how
+many sequences fit — and the pure-PyTorch gather becomes the bottleneck a CUDA
+kernel would replace.

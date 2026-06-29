@@ -32,9 +32,10 @@ class Attention(nn.Module):
     """Grouped-query attention. 14 query heads, 2 KV heads (each KV head serves
     7 query heads). q/k/v have a bias, o_proj doesn't — a Qwen2 quirk."""
 
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, layer_idx: int):
         super().__init__()
         self.cfg = cfg
+        self.layer_idx = layer_idx        # which slice of the KV cache is mine
         q_dim = cfg.num_q_heads * cfg.head_dim    # 896
         kv_dim = cfg.num_kv_heads * cfg.head_dim  # 128
         self.q_proj = nn.Linear(cfg.hidden_size, q_dim, bias=True)
@@ -43,7 +44,7 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(q_dim, cfg.hidden_size, bias=False)
         self.scale = 1.0 / math.sqrt(cfg.head_dim)
 
-    def forward(self, x, cos, sin, positions):
+    def forward(self, x, cos, sin, positions, paged=None):
         B, T, _ = x.shape
         cfg = self.cfg
         # project then split into heads: (B, T, H*d) -> (B, H, T, d)
@@ -53,18 +54,33 @@ class Attention(nn.Module):
 
         q, k = apply_rope(q, k, cos, sin, positions)
 
-        # copy each KV head 7 times so it lines up with the query heads it serves
-        k = k.repeat_interleave(cfg.n_rep, dim=1)  # (B, num_q_heads, T, d)
-        v = v.repeat_interleave(cfg.n_rep, dim=1)
+        if paged is None:
+            # M1 path: the keys are just this sequence's own tokens
+            k_full, v_full = k, v
+            # block a token from looking at tokens that come after it
+            mask = torch.triu(torch.full((T, T), float("-inf"), device=x.device), diagonal=1)
+        else:
+            # paged path: write this step's K/V into the cache, then read the whole history back.
+            # the cache stores (slot, kv_heads, d), so drop the batch dim and put tokens first.
+            paged.cache.write(self.layer_idx, paged.write_slots,
+                              k[0].transpose(0, 1), v[0].transpose(0, 1))
+            k_all, v_all = paged.cache.gather(self.layer_idx, paged.gather_slots)
+            k_full = k_all.transpose(0, 1).unsqueeze(0)   # (1, kv_heads, L, d)
+            v_full = v_all.transpose(0, 1).unsqueeze(0)
+            # a query at position p may attend any key whose position is <= p
+            mask = torch.where(paged.key_positions.view(1, -1) <= positions.view(-1, 1),
+                               0.0, float("-inf"))
 
-        # attention scores: how much each token attends to every earlier token
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, H, T, T)
-        # block a token from looking at tokens that come after it
-        mask = torch.triu(torch.full((T, T), float("-inf"), device=x.device), diagonal=1)
+        # copy each KV head 7 times so it lines up with the query heads it serves
+        k_full = k_full.repeat_interleave(cfg.n_rep, dim=1)
+        v_full = v_full.repeat_interleave(cfg.n_rep, dim=1)
+
+        # attention scores: how much each query attends to every key it's allowed to see
+        scores = torch.matmul(q, k_full.transpose(-2, -1)) * self.scale
         scores = scores + mask
         # softmax in float32 for stability, then back to x's dtype
         attn = F.softmax(scores, dim=-1, dtype=torch.float32).to(x.dtype)
-        out = torch.matmul(attn, v)                                  # (B, H, T, d)
+        out = torch.matmul(attn, v_full)
 
         out = out.transpose(1, 2).reshape(B, T, -1)                  # merge heads
         return self.o_proj(out)
@@ -88,14 +104,14 @@ class DecoderLayer(nn.Module):
     """One transformer block. Norm before each sublayer, add the input back
     around it (pre-norm), which keeps deep stacks stable."""
 
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, layer_idx: int):
         super().__init__()
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
-        self.self_attn = Attention(cfg)
+        self.self_attn = Attention(cfg, layer_idx)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.mlp = SwiGLU(cfg)
 
-    def forward(self, x, cos, sin, positions):
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin, positions)
+    def forward(self, x, cos, sin, positions, paged=None):
+        x = x + self.self_attn(self.input_layernorm(x), cos, sin, positions, paged)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
