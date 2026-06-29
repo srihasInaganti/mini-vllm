@@ -28,8 +28,12 @@ class PagedKVCache:
 
 @dataclass
 class PagedStep:
-    """Everything attention needs to use the cache for one forward step."""
+    """Everything attention needs to use the cache for one forward step.
+
+    The three lists are indexed by batch position — one entry per sequence — so a
+    single forward can serve a batch of sequences that each have their own history.
+    """
     cache: PagedKVCache
-    write_slots: torch.Tensor    # where this step's new tokens go in the pool
-    gather_slots: torch.Tensor   # every token to attend over (the whole history)
-    key_positions: torch.Tensor  # absolute position of each gathered key, for the mask
+    write_slots: list[torch.Tensor]    # per sequence: where this step's new tokens go
+    gather_slots: list[torch.Tensor]   # per sequence: every token to attend over
+    key_positions: list[torch.Tensor]  # per sequence: absolute position of each gathered key

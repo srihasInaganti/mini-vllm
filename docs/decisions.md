@@ -136,3 +136,69 @@ The pool is sized once from a memory budget. At 100x traffic that budget, the
 block size, and how full the last block runs become the levers that decide how
 many sequences fit — and the pure-PyTorch gather becomes the bottleneck a CUDA
 kernel would replace.
+
+---
+
+## Milestone 3
+
+The goal is a scheduler loop that serves many requests at once: every step it
+admits new requests, decodes one token for the whole running batch, retires
+sequences that just finished, and preempts when the block pool runs out.
+
+### Static vs continuous batching
+
+Static batching gathers a group of requests, runs them together until they all
+finish, then takes the next group. The whole group runs at the speed of its
+longest sequence. When a short request finishes early its slot just sits there
+doing wasted work until the rest catch up, and a request that shows up in the
+middle has to wait for the entire group to drain before it can start.
+
+Continuous batching rebuilds the batch every single decode step instead. A
+sequence that hits its limit is retired that step and its blocks freed; a request
+that just arrived is admitted into the next step. The batch is always full of
+sequences that are actually still generating, so the work isn't wasted on
+finished or padded slots. It only works because we implemented paging, which is
+why the cache came first.
+
+### Batching ragged lengths
+
+**Problem:** in a decode step every sequence is at a different length, so their
+gathers don't line up into one tensor.
+
+**Options:** loop the attention per sequence, or pad every sequence to the batch
+max length and attend in one masked batch.
+
+**Decision:** I loop the attention. Padding would waste compute.
+
+### Getting a new request into the batch
+
+**Problem:** a new request's prompt has to be processed before it can decode.
+
+**Decision:** prefill it on its own first, then it joins a decode batch where every
+sequence contributes exactly one token per step. Keeping prefill and decode
+separate makes the steady-state batch uniform and easy to reason about. Mixing
+many-token prefills and one-token decodes into a single forward is what production
+engines do, but the indexing is much fiddlier.
+
+### Eviction policy
+
+**Problem:** when the pool runs dry mid-step, something running has to give.
+
+**Decision:** preempt and recompute. I free a victim's blocks and put it back on
+the waiting queue; when it's readmitted its KV is rebuilt by re-running prefill
+over its prompt plus the tokens it already generated. No extra memory, and
+recompute is correct because a token's K/V only depend on the token and its
+position. The victim is the most recently admitted sequence, and it goes to the
+front of the waiting queue. Picking the newest means the oldest sequences are
+never the ones knocked out, so they keep making progress and nothing starves; the
+front-of-queue placement lets a preempted sequence resume as soon as memory frees.
+The alternative, swapping blocks to host RAM, avoids the recompute but needs swap
+space and copy logic.
+
+### At scale
+
+The per-sequence attention loop is the obvious bottleneck, it's Python overhead
+times batch size times layers. At 100x traffic this is the first thing to go: a
+varlen paged-attention kernel handles the whole ragged batch in one launch.
+Recompute-on-preempt also gets expensive for long sequences, so past some length
+swapping to host memory (or just a bigger pool) wins.

@@ -56,33 +56,39 @@ class Attention(nn.Module):
 
         if paged is None:
             # M1 path: the keys are just this sequence's own tokens
-            k_full, v_full = k, v
+            # copy each KV head 7 times so it lines up with the query heads it serves
+            k_full = k.repeat_interleave(cfg.n_rep, dim=1)
+            v_full = v.repeat_interleave(cfg.n_rep, dim=1)
             # block a token from looking at tokens that come after it
             mask = torch.triu(torch.full((T, T), float("-inf"), device=x.device), diagonal=1)
-        else:
-            # paged path: write this step's K/V into the cache, then read the whole history back.
-            # the cache stores (slot, kv_heads, d), so drop the batch dim and put tokens first.
-            paged.cache.write(self.layer_idx, paged.write_slots,
-                              k[0].transpose(0, 1), v[0].transpose(0, 1))
-            k_all, v_all = paged.cache.gather(self.layer_idx, paged.gather_slots)
-            k_full = k_all.transpose(0, 1).unsqueeze(0)   # (1, kv_heads, L, d)
-            v_full = v_all.transpose(0, 1).unsqueeze(0)
+            scores = torch.matmul(q, k_full.transpose(-2, -1)) * self.scale
+            scores = scores + mask
+            attn = F.softmax(scores, dim=-1, dtype=torch.float32).to(x.dtype)
+            out = torch.matmul(attn, v_full)
+            out = out.transpose(1, 2).reshape(B, T, -1)              # merge heads
+            return self.o_proj(out)
+
+        # paged path: each sequence has its own history, so attend one sequence at a
+        # time (the heavy projections above were already batched across the whole batch).
+        outs = []
+        for i in range(B):
+            # stash this sequence's new K/V, then read its whole history back.
+            # the cache stores (slot, kv_heads, d), so put tokens first.
+            paged.cache.write(self.layer_idx, paged.write_slots[i],
+                              k[i].transpose(0, 1), v[i].transpose(0, 1))
+            k_all, v_all = paged.cache.gather(self.layer_idx, paged.gather_slots[i])
+            ki = k_all.transpose(0, 1).repeat_interleave(cfg.n_rep, dim=0)  # (H, L, d)
+            vi = v_all.transpose(0, 1).repeat_interleave(cfg.n_rep, dim=0)
             # a query at position p may attend any key whose position is <= p
-            mask = torch.where(paged.key_positions.view(1, -1) <= positions.view(-1, 1),
+            mask = torch.where(paged.key_positions[i].view(1, -1) <= positions[i].view(-1, 1),
                                0.0, float("-inf"))
+            scores = torch.matmul(q[i], ki.transpose(-2, -1)) * self.scale  # (H, T, L)
+            scores = scores + mask
+            attn = F.softmax(scores, dim=-1, dtype=torch.float32).to(x.dtype)
+            outs.append(torch.matmul(attn, vi))                             # (H, T, d)
 
-        # copy each KV head 7 times so it lines up with the query heads it serves
-        k_full = k_full.repeat_interleave(cfg.n_rep, dim=1)
-        v_full = v_full.repeat_interleave(cfg.n_rep, dim=1)
-
-        # attention scores: how much each query attends to every key it's allowed to see
-        scores = torch.matmul(q, k_full.transpose(-2, -1)) * self.scale
-        scores = scores + mask
-        # softmax in float32 for stability, then back to x's dtype
-        attn = F.softmax(scores, dim=-1, dtype=torch.float32).to(x.dtype)
-        out = torch.matmul(attn, v_full)
-
-        out = out.transpose(1, 2).reshape(B, T, -1)                  # merge heads
+        out = torch.stack(outs, dim=0)                  # (B, H, T, d)
+        out = out.transpose(1, 2).reshape(B, T, -1)     # merge heads
         return self.o_proj(out)
 
 

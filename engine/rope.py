@@ -25,10 +25,19 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 def apply_rope(q: torch.Tensor, k: torch.Tensor,
                cos: torch.Tensor, sin: torch.Tensor,
                positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Rotate q and k. q,k: (B, H, T, head_dim). positions: (T,) = where each token sits."""
-    # gather the rows needed, then broadcast over batch + head dims: (1,1,T,d)
-    cos = cos[positions].unsqueeze(0).unsqueeze(0)
-    sin = sin[positions].unsqueeze(0).unsqueeze(0)
+    """Rotate q and k. q,k: (B, H, T, head_dim).
+
+    positions is (T,) when every sequence in the batch shares the same positions,
+    or (B, T) when each sequence sits at its own position (batched decode).
+    """
+    cos = cos[positions]
+    sin = sin[positions]
+    if cos.dim() == 2:                # (T, d) shared across the batch -> (1, 1, T, d)
+        cos = cos.unsqueeze(0).unsqueeze(0)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+    else:                             # (B, T, d) per sequence -> (B, 1, T, d)
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
     q_rot = q * cos + _rotate_half(q) * sin
     k_rot = k * cos + _rotate_half(k) * sin
     return q_rot, k_rot
