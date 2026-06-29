@@ -134,7 +134,7 @@ about cache accuracy.
 
 The pool is sized once from a memory budget. At 100x traffic that budget, the
 block size, and how full the last block runs become the levers that decide how
-many sequences fit — and the pure-PyTorch gather becomes the bottleneck a CUDA
+many sequences fit, and the pure-PyTorch gather becomes the bottleneck a CUDA
 kernel would replace.
 
 ---
@@ -202,3 +202,55 @@ times batch size times layers. At 100x traffic this is the first thing to go: a
 varlen paged-attention kernel handles the whole ragged batch in one launch.
 Recompute-on-preempt also gets expensive for long sequences, so past some length
 swapping to host memory (or just a bigger pool) wins.
+
+---
+
+## Milestone 4
+
+The goal is an OpenAI-compatible server: POST /v1/completions, both streaming and
+not, with temperature/top_p sampling, in a response shape a stock client accepts
+without changes. The catch is doing it without losing the batching from Milestone 3.
+
+### Keeping requests batched under a web server
+
+**Problem:** the scheduler is one synchronous loop, but a server gets many requests
+on an async event loop. If each request ran its own decode loop they'd never share
+a batch, which throws away continuous batching.
+
+**Options:** one background loop that owns the model and every request feeds into,
+each request runs its own generation, or run the loop in a separate thread and
+bridge with thread-safe queues.
+
+**Decision:** one background async task runs the scheduler step loop and owns the
+model. Each request hands its prompt to the scheduler and waits on its own queue;
+after every step the loop pushes new tokens to whichever queues are waiting. So
+all in-flight requests, from any connection, still batch together. The separate
+thread works too but mixing threads and asyncio is fiddlier, and per-request loops
+defeat the whole point.
+
+### Running the blocking step
+
+**Problem:** the model step is CPU work that blocks, but the event loop also has to
+stay responsive enough to admit new requests.
+
+**Decision:** run the step right in the event loop and yield between steps. There's
+only one model and one step happens at a time anyway, so an executor thread would
+mostly add plumbing. If step time grew, offloading it to a thread so the loop
+stays free for I/O is the next move.
+
+### Turning tokens into streamed text
+
+**Problem:** a single character can span several tokens, so emitting text token by
+token can stream broken bytes.
+
+**Decision:** decode the whole output so far each step and send only the new
+suffix. That way a multi-token character only appears once it's complete. It
+re-decodes every step, which is cheap at this scale but would want a smarter
+incremental detokenizer at high throughput.
+
+### Sampling
+
+Greedy is just temperature 0. Above that, temperature scales the logits and top_p
+keeps the smallest set of tokens that covers that probability mass before drawing
+one. Keeping greedy deterministic is what lets the server tests check that
+streaming and non-streaming give the same text.

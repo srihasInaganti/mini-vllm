@@ -9,17 +9,22 @@ from .config import ModelConfig
 from .kv_cache import PagedKVCache
 from .loader import load_model
 from .model import Qwen2Model
+from .sampling import SamplingParams, sample
+
+_GREEDY = SamplingParams()   # temperature 0, used when a request doesn't ask for sampling
 
 
 class Sequence:
     """One request's state as it moves through waiting -> running -> finished."""
 
-    def __init__(self, seq_id, prompt_ids: list[int], max_tokens: int, eos_id: int | None):
+    def __init__(self, seq_id, prompt_ids: list[int], max_tokens: int, eos_id: int | None,
+                 sampling_params: SamplingParams | None = None):
         self.seq_id = seq_id
         self.prompt_ids = list(prompt_ids)
         self.output_ids: list[int] = []
         self.max_tokens = max_tokens
         self.eos_id = eos_id
+        self.sampling_params = sampling_params or _GREEDY
         self.block_table: BlockTable | None = None   # set when admitted, cleared when preempted
 
     @property
@@ -77,7 +82,7 @@ class Scheduler:
         seq.block_table = BlockTable(self.manager)
         tokens = torch.tensor(seq.prompt_ids + seq.output_ids, device=self.device)
         logits = self.model.forward_paged(tokens, seq.block_table, self.cache)
-        seq.append(int(logits[0, -1].argmax()))
+        seq.append(sample(logits[0, -1], seq.sampling_params))
 
     def _make_room(self, active: list[Sequence]) -> None:
         # a sequence needs a fresh block this step exactly when its length is block-aligned
@@ -101,7 +106,7 @@ class Scheduler:
         logits = self.model.forward_decode(
             [s.last_token for s in active], [s.block_table for s in active], self.cache)
         for s, row in zip(active, logits):
-            s.append(int(row.argmax()))
+            s.append(sample(row, s.sampling_params))
 
     def _retire(self) -> list[Sequence]:
         done = [s for s in self.running if s.is_finished]
