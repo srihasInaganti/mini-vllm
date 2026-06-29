@@ -18,13 +18,14 @@ class Sequence:
     """One request's state as it moves through waiting -> running -> finished."""
 
     def __init__(self, seq_id, prompt_ids: list[int], max_tokens: int, eos_id: int | None,
-                 sampling_params: SamplingParams | None = None):
+                 sampling_params: SamplingParams | None = None, ignore_eos: bool = False):
         self.seq_id = seq_id
         self.prompt_ids = list(prompt_ids)
         self.output_ids: list[int] = []
         self.max_tokens = max_tokens
         self.eos_id = eos_id
         self.sampling_params = sampling_params or _GREEDY
+        self.ignore_eos = ignore_eos      # benchmarks force a fixed length by ignoring EOS
         self.block_table: BlockTable | None = None   # set when admitted, cleared when preempted
 
     @property
@@ -36,6 +37,8 @@ class Sequence:
     def is_finished(self) -> bool:
         if len(self.output_ids) >= self.max_tokens:
             return True
+        if self.ignore_eos:
+            return False
         return bool(self.output_ids) and self.output_ids[-1] == self.eos_id
 
     def append(self, token: int) -> None:

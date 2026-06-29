@@ -254,3 +254,57 @@ Greedy is just temperature 0. Above that, temperature scales the logits and top_
 keeps the smallest set of tokens that covers that probability mass before drawing
 one. Keeping greedy deterministic is what lets the server tests check that
 streaming and non-streaming give the same text.
+
+---
+
+## Milestone 5
+
+The goal is one harness that runs the same workload through three engines at
+concurrency 1, 8, and 32 and reports throughput, latency, time-to-first-token,
+peak memory, and max concurrent sequences before OOM. The headline is mini-vllm's
+throughput as a percentage of vLLM's.
+
+### Where it runs
+
+**Problem:** vLLM only runs on an NVIDIA GPU, and mini-vllm was built on CPU. A
+"percentage of vLLM" number only means something if both ran on the same machine.
+
+**Decision:** run all three on one CUDA box. mini-vllm is pure PyTorch, so it moves
+to the GPU with two env vars (device cuda, dtype bf16); transformers and vLLM run
+there too. Benchmarking mini-vllm on the Mac against vLLM somewhere else would make
+the headline number meaningless, so that option was off the table.
+
+### How the engines are driven
+
+**Problem:** the three engines have different APIs, and the comparison has to be fair.
+
+**Decision:** mini-vllm and vLLM are both driven through their OpenAI servers by one
+async client firing a fixed number of streaming requests with a concurrency cap.
+Same client, same prompts, same request shape, so the only difference being
+measured is the engine. transformers has no server and gets called in-process with
+static batching, which is the naive baseline it's meant to represent — giving it a
+server would mean rebuilding this whole project.
+
+### Controlling output length
+
+**Problem:** if engines stop at different points, throughput differs just because one
+generated fewer tokens.
+
+**Decision:** fix the length by ignoring EOS, so every request emits exactly
+max_tokens. Token counts are then identical across engines and throughput compares
+directly. That's why `ignore_eos` was added to the sequence and the server.
+
+### What each baseline proves
+
+transformers is the floor: static batching with no paging, so it wastes the batch
+on whoever finishes last and OOMs early. vLLM is the ceiling: the same idea as this
+project but with custom CUDA kernels. mini-vllm sits between them — the percentage
+says how much of vLLM's throughput a pure-PyTorch engine reaches, and the
+max-concurrency-before-OOM column is where paging shows up, since it should hold far
+more sequences than transformers before running out of memory.
+
+### At scale
+
+The numbers come from a single small GPU. The per-sequence Python attention loop
+caps how high the percentage can go; a varlen CUDA kernel is what would close most
+of the remaining gap to vLLM.

@@ -1,8 +1,11 @@
 # model + runtime settings, frozen so nothing can change the shape mid-run
 # numbers taken straight from Qwen2.5-0.5B-Instruct's config.json
+import os
 from dataclasses import dataclass
 
 import torch
+
+_DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 
 
 @dataclass(frozen=True)
@@ -29,3 +32,11 @@ class ModelConfig:
     def n_rep(self) -> int:
         # how many query heads each KV head feeds (14 / 2 = 7)
         return self.num_q_heads // self.num_kv_heads
+
+
+def config_from_env() -> ModelConfig:
+    # the benchmark box flips device/dtype via env (e.g. MINIVLLM_DEVICE=cuda, MINIVLLM_DTYPE=bf16)
+    return ModelConfig(
+        device=os.environ.get("MINIVLLM_DEVICE", "cpu"),
+        dtype=_DTYPES[os.environ.get("MINIVLLM_DTYPE", "fp32")],
+    )

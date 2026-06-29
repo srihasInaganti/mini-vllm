@@ -9,7 +9,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from transformers import AutoTokenizer
 
-from engine.config import ModelConfig
+from engine.config import ModelConfig, config_from_env
 from engine.sampling import SamplingParams
 from server.async_engine import AsyncLLMEngine
 
@@ -21,6 +21,7 @@ class CompletionRequest(BaseModel):
     temperature: float = 0.0
     top_p: float = 1.0
     stream: bool = False
+    ignore_eos: bool = False    # benchmarks set this to force exactly max_tokens
 
 
 # filled in at startup so the model loads once and the step loop starts on the event loop
@@ -29,7 +30,7 @@ state: dict = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    cfg = ModelConfig()
+    cfg = config_from_env()
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
     engine = AsyncLLMEngine(cfg=cfg, eos_id=tokenizer.eos_token_id)
     engine.start()
@@ -64,7 +65,8 @@ async def completions(req: CompletionRequest):
         )
 
     # non-streaming: drain the whole generation, then return one body
-    ids = [tok async for tok in engine.generate(prompt_ids, req.max_tokens, params)]
+    ids = [tok async for tok in
+           engine.generate(prompt_ids, req.max_tokens, params, req.ignore_eos)]
     text = tokenizer.decode(ids, skip_special_tokens=True)
     return {
         "id": cmpl_id,
@@ -101,7 +103,7 @@ async def _stream(engine, tokenizer, prompt_ids, req, cmpl_id, created, eos_id):
 
     ids: list[int] = []
     prev_text = ""
-    async for token in engine.generate(prompt_ids, req.max_tokens, params):
+    async for token in engine.generate(prompt_ids, req.max_tokens, params, req.ignore_eos):
         ids.append(token)
         # decode the whole output and emit only the new suffix, so characters that
         # span several tokens come out whole instead of as broken bytes

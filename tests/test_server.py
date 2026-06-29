@@ -30,6 +30,16 @@ def test_non_streaming_shape(client):
     assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
 
 
+def test_ignore_eos_forces_fixed_length(client):
+    # benchmarks need exactly max_tokens regardless of whether the model would stop early
+    r = client.post("/v1/completions",
+                    json={"prompt": "2 + 2 =", "max_tokens": 20,
+                          "temperature": 0.0, "ignore_eos": True})
+    body = r.json()
+    assert body["usage"]["completion_tokens"] == 20
+    assert body["choices"][0]["finish_reason"] == "length"
+
+
 def test_greedy_is_deterministic(client):
     payload = {"prompt": "The capital of France is", "max_tokens": 8, "temperature": 0.0}
     a = client.post("/v1/completions", json=payload).json()

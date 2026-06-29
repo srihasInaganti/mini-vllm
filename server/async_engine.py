@@ -51,14 +51,16 @@ class AsyncLLMEngine:
             if seq.seq_id in finished_ids:
                 queue.put_nowait(None)
 
-    async def generate(self, prompt_ids: list[int], max_tokens: int, params: SamplingParams):
+    async def generate(self, prompt_ids: list[int], max_tokens: int, params: SamplingParams,
+                       ignore_eos: bool = False):
         """Submit a request and yield its token ids one at a time as they're produced."""
         seq_id = self._next_id
         self._next_id += 1
         queue: asyncio.Queue = asyncio.Queue()
         self._queues[seq_id] = queue
         self._emitted[seq_id] = 0
-        self.scheduler.add(Sequence(seq_id, prompt_ids, max_tokens, self.eos_id, params))
+        self.scheduler.add(
+            Sequence(seq_id, prompt_ids, max_tokens, self.eos_id, params, ignore_eos))
         try:
             while True:
                 token = await queue.get()
